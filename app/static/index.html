@@ -26,7 +26,7 @@
   .tag.pending_review { background:#fde6e9; color:var(--bad); }
   .muted { color:var(--muted); }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  #upload-result { margin-top:10px; font-size:13px; white-space:pre-wrap; }
+  #upload-result, #manifest-result { margin-top:10px; font-size:13px; white-space:pre-wrap; }
   details { margin-top:8px; }
   input[type=text], input[type=number] { padding:6px 8px; border:1px solid var(--line); border-radius:5px; }
   a.dl { color:#0e3a5d; }
@@ -49,7 +49,23 @@
   </section>
 
   <section>
-    <h2>2. 报文状态（缺段与待核原因） <button class="ghost" id="btn-refresh">刷新</button></h2>
+    <h2>2. 应收清单与补传</h2>
+    <div class="row">
+      <label>站号 <input type="number" id="mf-station" placeholder="如 101" style="width:90px"></label>
+      <label>启动号 <input type="number" id="mf-boot" placeholder="如 7" style="width:90px"></label>
+      <input type="file" id="manifest-file" accept=".csv,.txt">
+      <button id="btn-manifest">上传清单</button>
+      <span class="muted">每行：报文号,总段数,整报SHA-256；同站同启动号整版替换，校验失败保留旧清单</span>
+    </div>
+    <div id="manifest-result"></div>
+    <table style="margin-top:10px">
+      <thead><tr><th>站号</th><th>启动号</th><th>清单条目</th><th>更新时间 (UTC)</th><th>补传 CSV</th></tr></thead>
+      <tbody id="manifest-body"><tr><td colspan="5" class="muted">—</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>3. 报文状态（缺段与待核原因） <button class="ghost" id="btn-refresh">刷新</button></h2>
     <table>
       <thead><tr>
         <th>站号</th><th>启动号</th><th>报文号</th><th>状态</th>
@@ -60,7 +76,7 @@
   </section>
 
   <section>
-    <h2>3. 已确认观测</h2>
+    <h2>4. 已确认观测</h2>
     <div class="row">
       <label>站号过滤 <input type="number" id="station-filter" placeholder="全部" style="width:90px"></label>
       <button class="ghost" id="btn-preview">预览</button>
@@ -96,6 +112,37 @@ $('btn-upload').onclick = async () => {
     refreshMessages(); loadObservations();
   } catch (e) { $('upload-result').textContent = '上传出错: ' + e; }
 };
+
+$('btn-manifest').onclick = async () => {
+  const s = $('mf-station').value.trim(), b = $('mf-boot').value.trim();
+  const f = $('manifest-file').files[0];
+  if (s === '' || b === '') { $('manifest-result').textContent = '请填写站号与启动号'; return; }
+  if (!f) { $('manifest-result').textContent = '请选择清单文件（每行：报文号,总段数,整报SHA-256）'; return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  $('manifest-result').textContent = '上传中…';
+  try {
+    const resp = await fetch(`/api/manifests/${encodeURIComponent(s)}/${encodeURIComponent(b)}`,
+                             {method:'POST', body:fd});
+    const data = await resp.json();
+    if (!resp.ok) { $('manifest-result').textContent = '上传失败: ' + (data.detail || resp.status); return; }
+    $('manifest-result').textContent =
+      `清单已${data.replaced ? '整版替换' : '保存'}：站${data.station_id}/启动${data.boot_id}，共 ${data.entries} 条`;
+    loadManifests();
+  } catch (e) { $('manifest-result').textContent = '上传出错: ' + e; }
+};
+
+async function loadManifests() {
+  const resp = await fetch('/api/manifests');
+  const {manifests} = await resp.json();
+  const tb = $('manifest-body');
+  tb.innerHTML = manifests.length
+    ? manifests.map(m => `<tr>
+        <td>${m.station_id}</td><td>${m.boot_id}</td><td>${m.entries}</td><td>${esc(m.updated_at)}</td>
+        <td><a class="dl" href="/api/retransmit.csv?station_id=${m.station_id}&boot_id=${m.boot_id}" download>下载补传 CSV</a></td>
+      </tr>`).join('')
+    : '<tr><td colspan="5" class="muted">暂无清单</td></tr>';
+}
 
 async function refreshMessages() {
   const resp = await fetch('/api/messages');
@@ -138,7 +185,7 @@ async function loadObservations() {
 
 $('btn-refresh').onclick = refreshMessages;
 $('btn-preview').onclick = loadObservations;
-refreshMessages(); loadObservations();
+refreshMessages(); loadObservations(); loadManifests();
 </script>
 </body>
 </html>

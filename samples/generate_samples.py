@@ -13,6 +13,9 @@
       报文2004: 先完整发布，随后收到内容被篡改的同号段 -> 转待核并撤下观测
       报文2005: 同一报文出现两个不同的整报摘要
 
+  sample_manifest.csv   —— 岸台应收清单样例（站101/启动7）
+      1001-1003 与 sample_upload.ndjson 的登记一致；1004 未到 -> 补传 CSV 请求整报
+
 用法: python3 samples/generate_samples.py
 """
 
@@ -82,6 +85,16 @@ def write_ndjson(name: str, records: list[dict]) -> None:
     print(f"wrote {path} ({len(records)} records)")
 
 
+def write_manifest(name: str, items: list[tuple[int, int, str]]) -> None:
+    """应收清单 CSV：每行 报文号,总段数,整报SHA-256。"""
+    path = os.path.join(OUT_DIR, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("msg_id,seg_total,sha256\n")
+        for msg_id, seg_total, sha256 in items:
+            fh.write(f"{msg_id},{seg_total},{sha256}\n")
+    print(f"wrote {path} ({len(items)} entries)")
+
+
 def main() -> None:
     rng = random.Random(20261115)
     day = datetime(2026, 11, 14, 22, 0, 0)
@@ -130,6 +143,12 @@ def main() -> None:
     out += [m2005[0], other]
 
     write_ndjson("sample_conflicts.ndjson", out)
+
+    # ---------- 应收清单样例（站101/启动7）：1001-1003 与上传样例登记一致，1004 未到 ----------
+    manifest = [(recs[0]["msg_id"], recs[0]["seg_total"], recs[0]["sha256"])
+                for recs in (m1001, m1002, m1003)]
+    manifest.append((1004, 2, hashlib.sha256(b"msg 1004 placeholder").hexdigest()))
+    write_manifest("sample_manifest.csv", manifest)
 
 
 if __name__ == "__main__":

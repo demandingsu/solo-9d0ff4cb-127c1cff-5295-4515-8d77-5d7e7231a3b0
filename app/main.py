@@ -1,12 +1,16 @@
 """沿海潮位卫星短报文采集服务（FastAPI + SQLite）。
 
 接口：
-  GET  /                                采集网页（上传 / 报文状态 / 观测预览与下载）
+  GET  /                                采集网页（上传 / 清单与补传 / 报文状态 / 观测）
   POST /api/upload                      上传 NDJSON（multipart 文件或裸文本）
   GET  /api/messages                    报文状态：已收/缺段/待核原因
   GET  /api/observations                已确认观测（JSON 预览）
   GET  /api/observations.csv            已确认观测下载（可选 ?station_id=）
   DELETE /api/messages/{station}/{boot}/{msg}  待核处理后复位报文，允许重新采集
+  POST /api/manifests/{station}/{boot}  上传应收清单（同站同启动号整版替换）
+  GET  /api/manifests                   全部清单版本（条目数、更新时间）
+  GET  /api/manifests/{station}/{boot}  当前清单明细
+  GET  /api/retransmit.csv              补传请求 CSV（?station_id=&boot_id=）
 """
 
 from __future__ import annotations
@@ -100,6 +104,61 @@ def create_app(db_path: str) -> FastAPI:
         if not removed:
             raise HTTPException(status_code=404, detail="报文不存在")
         return {"deleted": True}
+
+    @app.post("/api/manifests/{station_id}/{boot_id}")
+    async def upload_manifest(request: Request, station_id: int, boot_id: int,
+                              file: UploadFile | None = File(default=None)):
+        """上传应收清单（每行 `报文号,总段数,整报SHA-256`），同站同启动号整版替换。
+
+        先整体校验再落库：校验或保存失败都保留旧清单。
+        """
+        if file is not None:
+            raw = await file.read()
+        else:
+            raw = await request.body()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="清单必须是 UTF-8 编码的文本")
+        try:
+            entries = core.validate_manifest(text.lstrip("\ufeff"))
+        except core.ManifestError as exc:
+            raise HTTPException(status_code=400,
+                                detail=f"清单校验失败，旧清单已保留: {exc}") from None
+        # 串行化写入；单事务整版替换，失败回滚即保留旧清单
+        with write_lock:
+            return core.replace_manifest(request.app.state.db, station_id, boot_id, entries)
+
+    @app.get("/api/manifests")
+    async def manifests(request: Request):
+        return {"manifests": core.list_manifests(request.app.state.db)}
+
+    @app.get("/api/manifests/{station_id}/{boot_id}")
+    async def manifest_detail(request: Request, station_id: int, boot_id: int):
+        manifest = core.get_manifest(request.app.state.db, station_id, boot_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="该站/启动号尚无清单")
+        return manifest
+
+    @app.get("/api/retransmit.csv")
+    async def retransmit_csv(request: Request, station_id: int, boot_id: int):
+        # 写锁 + 单读事务：下载只反映某一已提交快照，不混入未提交数据或不同清单版本
+        with write_lock:
+            rows = core.retransmit_requests(request.app.state.db, station_id, boot_id)
+        if rows is None:
+            raise HTTPException(status_code=404, detail="该站/启动号尚无清单，请先上传")
+        lines = ["station_id,boot_id,msg_id,request,segments,seg_total,sha256,reason"]
+        for r in rows:
+            segs = ";".join(str(s) for s in r["segments"])
+            lines.append(
+                f"{r['station_id']},{r['boot_id']},{r['msg_id']},{r['request']},"
+                f"{segs},{r['seg_total']},{r['sha256']},{r['reason']}")
+        return Response(
+            "\n".join(lines) + "\n",
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition":
+                     f'attachment; filename="retransmit_{station_id}_{boot_id}.csv"'},
+        )
 
     return app
 

@@ -47,6 +47,24 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_obs_msg
     ON observations (station_id, boot_id, msg_id);
+
+-- 岸台应收报文清单：每个 (站号, 启动号) 一版，上传时整版替换。
+CREATE TABLE IF NOT EXISTS manifests (
+    station_id  INTEGER NOT NULL,
+    boot_id     INTEGER NOT NULL,
+    entries     INTEGER NOT NULL,
+    updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (station_id, boot_id)
+);
+
+CREATE TABLE IF NOT EXISTS manifest_entries (
+    station_id  INTEGER NOT NULL,
+    boot_id     INTEGER NOT NULL,
+    msg_id      INTEGER NOT NULL,
+    seg_total   INTEGER NOT NULL,
+    sha256      TEXT    NOT NULL,
+    PRIMARY KEY (station_id, boot_id, msg_id)
+);
 """
 
 

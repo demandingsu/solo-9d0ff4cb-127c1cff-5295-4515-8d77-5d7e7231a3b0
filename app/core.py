@@ -25,6 +25,7 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime
 
@@ -307,3 +308,171 @@ def reset_message(con: sqlite3.Connection, station_id: int, boot_id: int, msg_id
         con.execute("ROLLBACK")
         raise
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# 岸台应收报文清单与补传请求
+# ---------------------------------------------------------------------------
+
+_INT_RE = re.compile(r"^-?[0-9]+$")
+_MANIFEST_HEADER = ("msg_id", "seg_total", "sha256")
+
+
+class ManifestError(ValueError):
+    """清单内容不合法（校验失败，调用方必须保留旧清单）。"""
+
+
+def validate_manifest(text: str) -> list[dict]:
+    """解析并校验清单文本，每行 `报文号,总段数,整报SHA-256`。
+
+    允许空行、`#` 注释行与表头行 `msg_id,seg_total,sha256`（大小写不限）。
+    全部行校验通过才返回条目列表；任一行非法或报文号重复即抛
+    ManifestError —— 调用方据此拒绝整份清单并保留旧版。
+    """
+    entries: list[dict] = []
+    seen: dict[int, int] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if tuple(p.lower() for p in parts) == _MANIFEST_HEADER:
+            continue  # 表头行
+        if len(parts) != 3:
+            raise ManifestError(
+                f"第 {lineno} 行应有 3 列（报文号,总段数,整报SHA-256）: {line!r}")
+        msg_s, total_s, sha = parts
+        if not _INT_RE.match(msg_s):
+            raise ManifestError(f"第 {lineno} 行报文号不是整数: {msg_s!r}")
+        if not _INT_RE.match(total_s):
+            raise ManifestError(f"第 {lineno} 行总段数不是整数: {total_s!r}")
+        msg_id, seg_total = int(msg_s), int(total_s)
+        if seg_total < 1:
+            raise ManifestError(f"第 {lineno} 行总段数必须 >= 1: {seg_total}")
+        sha = sha.lower()
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+            raise ManifestError(f"第 {lineno} 行 SHA-256 必须是 64 位十六进制: {sha!r}")
+        if msg_id in seen:
+            raise ManifestError(
+                f"第 {lineno} 行与第 {seen[msg_id]} 行的报文号重复: {msg_id}")
+        seen[msg_id] = lineno
+        entries.append({"msg_id": msg_id, "seg_total": seg_total, "sha256": sha})
+    if not entries:
+        raise ManifestError("清单不含任何有效条目")
+    entries.sort(key=lambda e: e["msg_id"])
+    return entries
+
+
+def replace_manifest(con: sqlite3.Connection, station_id: int, boot_id: int,
+                     entries: list[dict]) -> dict:
+    """整版替换 (站号, 启动号) 的清单。调用方须持有写锁。
+
+    单事务内先删旧条目再写新条目；任何失败整体回滚，旧清单原样保留，
+    读者不会看到删了一半或混入两版的清单。
+    """
+    key = (station_id, boot_id)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        cur = con.execute(
+            "DELETE FROM manifest_entries WHERE station_id=? AND boot_id=?", key)
+        con.executemany(
+            "INSERT INTO manifest_entries (station_id, boot_id, msg_id, seg_total, sha256)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [(station_id, boot_id, e["msg_id"], e["seg_total"], e["sha256"])
+             for e in entries],
+        )
+        con.execute(
+            "INSERT INTO manifests (station_id, boot_id, entries, updated_at)"
+            " VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+            " ON CONFLICT (station_id, boot_id) DO UPDATE SET"
+            "   entries=excluded.entries, updated_at=excluded.updated_at",
+            (station_id, boot_id, len(entries)),
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    return {"station_id": station_id, "boot_id": boot_id,
+            "entries": len(entries), "replaced": cur.rowcount > 0}
+
+
+def list_manifests(con: sqlite3.Connection) -> list[dict]:
+    """全部清单版本（站号、启动号、条目数、更新时间）。"""
+    rows = con.execute(
+        "SELECT station_id, boot_id, entries, updated_at FROM manifests"
+        " ORDER BY station_id, boot_id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_manifest(con: sqlite3.Connection, station_id: int,
+                 boot_id: int) -> dict | None:
+    """某站/启动号的当前清单明细；无清单返回 None。"""
+    head = con.execute(
+        "SELECT station_id, boot_id, entries, updated_at FROM manifests"
+        " WHERE station_id=? AND boot_id=?", (station_id, boot_id)).fetchone()
+    if head is None:
+        return None
+    items = con.execute(
+        "SELECT msg_id, seg_total, sha256 FROM manifest_entries"
+        " WHERE station_id=? AND boot_id=? ORDER BY msg_id",
+        (station_id, boot_id)).fetchall()
+    return {**dict(head), "items": [dict(r) for r in items]}
+
+
+def retransmit_requests(con: sqlite3.Connection, station_id: int,
+                        boot_id: int) -> list[dict] | None:
+    """计算该站/启动号的补传请求。调用方须持有写锁。
+
+    本函数自成一个读事务：清单条目与报文状态来自同一快照，并发上传、
+    替换或复位时不会混入未提交数据或不同清单版本。只按清单条目做主键
+    核查，不扫描历史报文。返回 None 表示该站/启动号尚无清单。
+
+    规则（对清单中每个报文号）：
+      * 报文未到 / 待核 / 登记的总段数或摘要与清单不符 -> 请求整报；
+      * 登记一致但尚缺段 -> 只请求缺段；
+      * 已发布且登记与清单一致（完整匹配）-> 不请求。
+    """
+    key = (station_id, boot_id)
+    con.execute("BEGIN")
+    try:
+        entries = con.execute(
+            "SELECT msg_id, seg_total, sha256 FROM manifest_entries"
+            " WHERE station_id=? AND boot_id=? ORDER BY msg_id", key).fetchall()
+        if not entries:
+            con.execute("COMMIT")
+            return None
+        out: list[dict] = []
+        for e in entries:
+            mkey = (station_id, boot_id, e["msg_id"])
+            row = con.execute(
+                f"SELECT seg_total, sha256, status FROM messages WHERE {MSG_KEY}",
+                mkey).fetchone()
+            base = {"station_id": station_id, "boot_id": boot_id,
+                    "msg_id": e["msg_id"], "seg_total": e["seg_total"],
+                    "sha256": e["sha256"]}
+            if row is None:
+                out.append({**base, "request": "message", "segments": [],
+                            "reason": "报文未到"})
+                continue
+            if row["status"] == "pending_review":
+                out.append({**base, "request": "message", "segments": [],
+                            "reason": "报文待核"})
+                continue
+            if row["seg_total"] != e["seg_total"] or row["sha256"] != e["sha256"]:
+                out.append({**base, "request": "message", "segments": [],
+                            "reason": "登记总段数/摘要与清单不符"})
+                continue
+            if row["status"] == "published":
+                continue  # 完整匹配，不请求
+            have = {r["seg_no"] for r in con.execute(
+                f"SELECT seg_no FROM segments WHERE {MSG_KEY}", mkey)}
+            missing = sorted(set(range(1, e["seg_total"] + 1)) - have)
+            if missing:
+                out.append({**base, "request": "segments", "segments": missing,
+                            "reason": "缺段"})
+        con.execute("COMMIT")
+        return out
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
